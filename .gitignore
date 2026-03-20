@@ -1,0 +1,11 @@
+cat > .gitignore << EOF
+# never commit these
+.env
+*.env
+.env.local
+kubectl-ai        # compiled binary
+aik8scopilot      # compiled binary
+
+# mac noise
+.DS_Store
+EOF
