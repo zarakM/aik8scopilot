@@ -4,6 +4,7 @@ package ai
 // No special SDK needed — the API is just JSON over HTTPS.
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -32,8 +33,23 @@ type ClaudeClient struct {
 type claudeRequest struct {
 	Model     string    `json:"model"`
 	MaxTokens int       `json:"max_tokens"`
+	Stream    bool      `json:"stream"`
 	System    string    `json:"system"`
 	Messages  []message `json:"messages"`
+}
+
+// streamEvent mirrors the SSE JSON payloads the Anthropic streaming API sends.
+// Only the fields we act on are decoded; unknown fields are silently ignored.
+type streamEvent struct {
+	Type  string `json:"type"`
+	Delta struct {
+		Type string `json:"type"` // "text_delta" for token chunks
+		Text string `json:"text"`
+	} `json:"delta"`
+	Error *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 type message struct {
@@ -41,16 +57,6 @@ type message struct {
 	Content string `json:"content"`
 }
 
-type claudeResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	Error *struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
-}
 
 func NewClaudeClient(apiKey string) *ClaudeClient {
 	return &ClaudeClient{
@@ -59,28 +65,31 @@ func NewClaudeClient(apiKey string) *ClaudeClient {
 	}
 }
 
-// Diagnose sends the diagnostic data to Claude and returns the analysis.
-func (c *ClaudeClient) Diagnose(ctx context.Context, data *k8s.DiagnosticData) (string, error) {
-	reqBody := claudeRequest{
+// Diagnose streams the diagnosis directly to out, printing tokens as they arrive.
+// The caller is responsible for any surrounding formatting (separators, newlines).
+func (c *ClaudeClient) Diagnose(ctx context.Context, data *k8s.DiagnosticData, out io.Writer) error {
+	return c.streamTo(ctx, claudeRequest{
 		Model:     claudeModel,
 		MaxTokens: 1024,
+		Stream:    true,
 		System:    systemPrompt(),
-		Messages: []message{
-			{Role: "user", Content: buildPrompt(data)},
-		},
-	}
+		Messages:  []message{{Role: "user", Content: buildPrompt(data)}},
+	}, out)
+}
 
-	// json.Marshal converts the struct to a JSON byte slice.
+// streamTo is the shared SSE streaming implementation used by all Diagnose* methods.
+// The Anthropic streaming API sends Server-Sent Events — lines prefixed with "data: "
+// containing JSON payloads. We decode each chunk and write text deltas to out immediately,
+// so the user sees output token by token rather than waiting for the full response.
+func (c *ClaudeClient) streamTo(ctx context.Context, reqBody claudeRequest, out io.Writer) error {
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to build request: %w", err)
+		return fmt.Errorf("failed to build request: %w", err)
 	}
 
-	// bytes.NewReader wraps a byte slice in an io.Reader interface,
-	// which is what http.NewRequest expects for the body.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, claudeAPIURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -89,92 +98,70 @@ func (c *ClaudeClient) Diagnose(ctx context.Context, data *k8s.DiagnosticData) (
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("API request failed: %w", err)
+		return fmt.Errorf("API request failed: %w", err)
 	}
 	// defer runs when the surrounding function returns — critical for closing
 	// the response body to avoid leaking the HTTP connection.
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
-
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result claudeResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("failed to parse API response: %w", err)
+	// bufio.Scanner reads one line at a time without buffering the full body.
+	// This is what makes streaming work — we process each SSE event as it arrives.
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// SSE format: payload lines start with "data: "; blank lines separate events.
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			break
+		}
+
+		var event streamEvent
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			// Skip malformed events — the stream may include keepalive pings
+			// or future event types we don't know about yet.
+			continue
+		}
+
+		switch event.Type {
+		case "content_block_delta":
+			if event.Delta.Type == "text_delta" {
+				// Write without buffering so the terminal updates immediately.
+				fmt.Fprint(out, event.Delta.Text)
+			}
+		case "error":
+			return fmt.Errorf("Claude API error (%s): %s", event.Error.Type, event.Error.Message)
+		}
 	}
 
-	if result.Error != nil {
-		return "", fmt.Errorf("Claude API error (%s): %s", result.Error.Type, result.Error.Message)
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading stream: %w", err)
 	}
 
-	if len(result.Content) == 0 {
-		return "", fmt.Errorf("empty response from Claude")
-	}
-
-	return result.Content[0].Text, nil
+	// Streaming output doesn't guarantee a trailing newline — add one so the
+	// caller's closing separator lands on its own line.
+	fmt.Fprintln(out)
+	return nil
 }
 
-// DiagnosePending sends pending-pod diagnostic data to Claude and returns the analysis.
-// It uses a scheduling-focused system prompt instead of the crash-focused one.
-func (c *ClaudeClient) DiagnosePending(ctx context.Context, data *k8s.PendingDiagnosticData) (string, error) {
-	reqBody := claudeRequest{
+// DiagnosePending streams the pending-pod diagnosis to out using the scheduling-focused prompt.
+func (c *ClaudeClient) DiagnosePending(ctx context.Context, data *k8s.PendingDiagnosticData, out io.Writer) error {
+	return c.streamTo(ctx, claudeRequest{
 		Model:     claudeModel,
 		MaxTokens: 1024,
+		Stream:    true,
 		System:    pendingSystemPrompt(),
-		Messages: []message{
-			{Role: "user", Content: buildPendingPrompt(data)},
-		},
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("failed to build request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, claudeAPIURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("API request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result claudeResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("failed to parse API response: %w", err)
-	}
-
-	if result.Error != nil {
-		return "", fmt.Errorf("Claude API error (%s): %s", result.Error.Type, result.Error.Message)
-	}
-
-	if len(result.Content) == 0 {
-		return "", fmt.Errorf("empty response from Claude")
-	}
-
-	return result.Content[0].Text, nil
+		Messages:  []message{{Role: "user", Content: buildPendingPrompt(data)}},
+	}, out)
 }
 
 // pendingSystemPrompt is tuned for scheduling failures, not runtime crashes.

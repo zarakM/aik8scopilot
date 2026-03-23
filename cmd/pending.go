@@ -56,12 +56,10 @@ func runPending(cmd *cobra.Command, args []string) error {
 	fmt.Println("─────────────────────────────────────────────")
 
 	claudeClient := ai.NewClaudeClient(apiKey)
-	diagnosis, err := claudeClient.DiagnosePending(ctx, data)
-	if err != nil {
+	if err := claudeClient.DiagnosePending(ctx, data, os.Stdout); err != nil {
 		return fmt.Errorf("AI diagnosis failed: %w", err)
 	}
 
-	fmt.Println(diagnosis)
 	fmt.Println("─────────────────────────────────────────────")
 
 	return nil
