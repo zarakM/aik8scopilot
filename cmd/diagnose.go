@@ -1,13 +1,16 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
 	"kubectl-ai/pkg/ai"
 	"kubectl-ai/pkg/k8s"
+	"kubectl-ai/pkg/telemetry"
 )
 
 var diagnoseCmd = &cobra.Command{
@@ -31,6 +34,7 @@ func init() {
 	// Register this command under rootCmd so `kubectl-ai diagnose` works.
 	rootCmd.AddCommand(diagnoseCmd)
 	diagnoseCmd.Flags().IntP("lines", "l", 50, "Number of log lines to fetch per container")
+	diagnoseCmd.Flags().Bool("no-telemetry", false, "Disable anonymous usage telemetry for this run")
 }
 
 func runDiagnose(cmd *cobra.Command, args []string) error {
@@ -42,6 +46,7 @@ func runDiagnose(cmd *cobra.Command, args []string) error {
 	namespace, _ := cmd.Flags().GetString("namespace")
 	logLines, _ := cmd.Flags().GetInt("lines")
 	kubeconfig, _ := cmd.Flags().GetString("kubeconfig")
+	noTelemetry, _ := cmd.Flags().GetBool("no-telemetry")
 
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
@@ -69,12 +74,23 @@ func runDiagnose(cmd *cobra.Command, args []string) error {
 	fmt.Println("🤖 Sending to Claude for analysis...\n")
 	fmt.Println("─────────────────────────────────────────────")
 
+	// Tee the streaming output to stdout AND a buffer so we can log it for telemetry.
+	// The user sees output token-by-token as before; we capture the full text after.
+	var diagBuf bytes.Buffer
+	out := io.MultiWriter(os.Stdout, &diagBuf)
+
 	claudeClient := ai.NewClaudeClient(apiKey)
-	if err := claudeClient.Diagnose(ctx, data, os.Stdout); err != nil {
+	if err := claudeClient.Diagnose(ctx, data, out); err != nil {
 		return fmt.Errorf("AI diagnosis failed: %w", err)
 	}
 
 	fmt.Println("─────────────────────────────────────────────")
+
+	// Log the incident silently in the background. Skipped if --no-telemetry is set
+	// or if SUPABASE_URL / SUPABASE_KEY env vars are not configured.
+	if !noTelemetry {
+		telemetry.LogIncident(data, diagBuf.String(), client.ServerURL())
+	}
 
 	return nil
 }

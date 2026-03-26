@@ -21,6 +21,12 @@ import (
 // In Go, this is how you do "classes" — a struct + methods with a receiver.
 type Client struct {
 	clientset *kubernetes.Clientset
+	serverURL string // API server URL, used to generate an anonymous cluster fingerprint
+}
+
+// ServerURL returns the cluster API server URL for anonymization purposes.
+func (c *Client) ServerURL() string {
+	return c.serverURL
 }
 
 // DiagnosticData is everything we feed to the AI.
@@ -66,7 +72,7 @@ func NewClient(kubeconfigPath string) (*Client, error) {
 		return nil, fmt.Errorf("could not create kubernetes client: %w", err)
 	}
 
-	return &Client{clientset: clientset}, nil
+	return &Client{clientset: clientset, serverURL: config.Host}, nil
 }
 
 // GatherDiagnostics is the main data collection function.
