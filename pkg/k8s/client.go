@@ -75,6 +75,16 @@ func NewClient(kubeconfigPath string) (*Client, error) {
 	return &Client{clientset: clientset, serverURL: config.Host}, nil
 }
 
+// GetPodPhase fetches just the pod phase so the caller can decide which
+// diagnostic path to take before doing the heavier data collection.
+func (c *Client) GetPodPhase(ctx context.Context, namespace, podName string) (string, error) {
+	pod, err := c.clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("pod %q not found in namespace %q: %w", podName, namespace, err)
+	}
+	return string(pod.Status.Phase), nil
+}
+
 // GatherDiagnostics is the main data collection function.
 // It fetches the pod, its logs, and its events — everything the AI needs.
 func (c *Client) GatherDiagnostics(ctx context.Context, namespace, podName string, logLines int) (*DiagnosticData, error) {

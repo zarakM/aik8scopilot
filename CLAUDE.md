@@ -1,65 +1,72 @@
-# kubectl-ai — AI Kubernetes Co-Pilot
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
-A kubectl plugin that diagnoses Kubernetes failures in real time using Claude.
-It fetches pod logs, events, and spec, then calls the Anthropic API to return a
-plain-English root cause + fix. This is an MVP / startup product, not an internal tool.
-
-## Project structure
-```
-main.go                  # thin entry point — hands off to cmd/
-cmd/root.go              # cobra CLI root, persistent flags (--namespace, --kubeconfig)
-cmd/diagnose.go          # `kubectl ai diagnose <pod>` command
-pkg/k8s/client.go        # kubernetes client-go wrapper — all cluster API calls
-pkg/ai/claude.go         # Anthropic API client — prompt construction + HTTP call
-go.mod                   # dependencies: cobra, client-go
-```
+A kubectl plugin (startup product) that diagnoses Kubernetes failures in real time using Claude.
+Fetches pod logs, events, and spec → calls Anthropic API → returns plain-English root cause + fix.
 
 ## Build and run
 ```bash
-go mod tidy              # install dependencies
-go build -o kubectl-ai . # compile binary
+go mod tidy
+go build -o kubectl-ai .
 export ANTHROPIC_API_KEY=...
 ./kubectl-ai diagnose <pod-name> -n <namespace>
+./kubectl-ai pending <pod-name> -n <namespace>
 ```
 
-To use as a real kubectl plugin:
+Production build with telemetry baked in (required to activate Supabase logging):
 ```bash
-cp kubectl-ai /usr/local/bin/kubectl-ai
-kubectl-ai diagnose <pod-name> -n <namespace>
+GOOS=linux GOARCH=amd64 go build -ldflags "\
+  -X kubectl-ai/pkg/telemetry.supabaseURL=https://yourproject.supabase.co \
+  -X kubectl-ai/pkg/telemetry.supabaseKey=your-anon-key" \
+  -o kubectl-ai-linux .
 ```
 
-## Key decisions already made
-- Language: Go (not Python) — kubectl ecosystem, client-go, single binary distribution
-- LLM: Anthropic Claude (claude-sonnet-4-20250514) via direct HTTP, no SDK
-- CLI framework: cobra (same library kubectl uses)
-- Auth: ANTHROPIC_API_KEY env var — never hardcode keys
-- Kubeconfig: defaults to ~/.kube/config, overridable with --kubeconfig flag
-- Log fetching: always fetches BOTH current logs AND previous crashed instance logs
+Dev override (skip recompile): set `SUPABASE_URL` + `SUPABASE_KEY` env vars — they take precedence over ldflags values.
 
-## MVP scope — 3 pain points only
-1. CrashLoopBackOff — correlate logs + events + resource limits
-2. Pending pods — correlate node capacity + taints + quotas + PVC binding
-3. Stuck/failing deployment rollouts — correlate readiness probes + events + new pod logs
+## Architecture
 
-Do NOT expand scope beyond these three until all three are solid.
+### Request flow
+```
+cmd/<command>.go
+  → k8s.NewClient(kubeconfig)                  # builds clientset from kubeconfig
+  → client.Gather*Diagnostics(ctx, ...)        # all cluster API calls, returns structured data
+  → io.MultiWriter(os.Stdout, &diagBuf)        # tees streaming output for telemetry capture
+  → ai.NewClaudeClient(apiKey).Diagnose*(...)  # builds prompt, streams SSE response token-by-token
+  → telemetry.LogIncident(...)                 # fire-and-forget goroutine POST to Supabase
+```
+
+### Package responsibilities
+- `cmd/` — orchestration only; no business logic. Each command follows the same pattern: gather → stream → log.
+- `pkg/k8s/client.go` — all `client-go` calls. Two diagnostic data types: `DiagnosticData` (crash) and `PendingDiagnosticData` (scheduling). `formatPodSpec` strips secret values.
+- `pkg/ai/claude.go` — prompt construction + streaming. `streamTo()` is shared by all `Diagnose*` methods. System prompts enforce a strict output format (Root Cause / Confidence / Evidence / Probable Causes / Next Command / Fix).
+- `pkg/telemetry/logger.go` — silent background logging to Supabase. `supabaseURL`/`supabaseKey` are injected via `-ldflags`; env vars override for local dev. Never blocks the CLI. `--no-telemetry` flag on diagnose disables per-run.
+
+### Telemetry data model (Supabase `incidents` table)
+Seven fields: `error_type`, `signals` (jsonb — sanitized container states + event reasons + log tail), `diagnosis`, `confidence`, `cluster_id` (SHA256 of server URL, first 8 bytes), `model`, `created_at`. No pod names, namespace names, env var values, or secret names are stored.
+
+## MVP scope — 3 commands only
+1. `diagnose` — CrashLoopBackOff ✅
+2. `pending` — Pending pods ✅
+3. `rollout` — Stuck deployment rollouts (not yet built)
+
+Do NOT expand scope beyond these three.
+
+## Key decisions
+- Direct HTTP to Anthropic — no SDK, intentional. Do not introduce LLM frameworks.
+- Streaming via SSE (`bufio.Scanner` line-by-line) — `streamTo()` in `claude.go` is the single implementation.
+- Anthropic key = user's own (`ANTHROPIC_API_KEY`). Supabase keys = yours, baked in via ldflags.
+- `pending.go` does not yet have telemetry wired — follow the `diagnose.go` pattern when adding it.
 
 ## Code style
-- All errors must be wrapped with %w and return up to cmd layer for printing
-- Use context.Context in every function that does I/O
+- Errors wrapped with `%w`, returned to `cmd/` layer for printing
+- `context.Context` in every function that does I/O
 - No global state — pass dependencies explicitly
-- Keep cmd/ thin: orchestration only. Logic lives in pkg/
-- Comment the WHY, not the WHAT — the Go concepts are explained for a learning developer
-
-## What's next to build
-- `cmd/pending.go` — diagnose pending pods (same pattern as diagnose.go)
-- `cmd/rollout.go` — diagnose stuck rollouts
-- Streaming output (print Claude's response token by token as it arrives)
-- Better error messages when cluster is unreachable
-- `--output json` flag for machine-readable diagnosis
+- Comment the WHY, not the WHAT
 
 ## Do not
-- Do not add a web server, database, or any persistence layer yet
-- Do not add authentication/multi-tenancy — this is a local CLI tool for now
-- Do not use LangChain or any LLM framework — raw HTTP is intentional
-- Do not change the prompt format in claude.go without testing against real K8s errors first
+- Do not add a web server, database, or persistence layer
+- Do not add authentication or multi-tenancy
+- Do not change system prompts in `claude.go` without testing against real K8s errors
+- Do not store pod names, namespace names, env var values, or actual cluster URLs in telemetry

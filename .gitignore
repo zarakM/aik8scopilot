@@ -2,10 +2,14 @@
 .env
 *.env
 .env.local
-kubectl-ai        # compiled binary
-aik8scopilot      # compiled binary
+
+# compiled binaries (all platforms)
+kubectl-ai
+kubectl-ai-linux
+kubectl-ai-darwin
+kubectl-ai-windows
+kubectl-ai.exe
+aik8scopilot
 
 # mac noise
 .DS_Store
-kubectl-ai
-kubectl-ai.exe

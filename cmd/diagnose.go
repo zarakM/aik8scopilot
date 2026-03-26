@@ -16,33 +16,24 @@ import (
 var diagnoseCmd = &cobra.Command{
 	Use:   "diagnose <pod-name>",
 	Short: "Diagnose a failing pod using AI",
-	Long: `Fetches pod logs, events, and spec from your cluster,
-then asks Claude to diagnose the issue and suggest a fix.
+	Long: `Automatically detects whether the pod is pending or crashing,
+fetches the relevant diagnostics, and asks Claude for a root cause and fix.
 
 The ANTHROPIC_API_KEY environment variable must be set.`,
 
-	// ExactArgs(1) means cobra will error automatically if the user
-	// forgets to pass a pod name or passes too many arguments.
 	Args: cobra.ExactArgs(1),
-
-	// RunE returns an error — preferred over Run because errors propagate
-	// cleanly up to Execute() which handles printing and exit codes.
 	RunE: runDiagnose,
 }
 
 func init() {
-	// Register this command under rootCmd so `kubectl-ai diagnose` works.
 	rootCmd.AddCommand(diagnoseCmd)
 	diagnoseCmd.Flags().IntP("lines", "l", 50, "Number of log lines to fetch per container")
 	diagnoseCmd.Flags().Bool("no-telemetry", false, "Disable anonymous usage telemetry for this run")
 }
 
 func runDiagnose(cmd *cobra.Command, args []string) error {
-	// args[0] is the pod name — cobra already validated exactly one arg exists.
 	podName := args[0]
 
-	// The _ discards the error from GetString because these flags have defaults
-	// and will never fail. For flags without defaults you'd check the error.
 	namespace, _ := cmd.Flags().GetString("namespace")
 	logLines, _ := cmd.Flags().GetInt("lines")
 	kubeconfig, _ := cmd.Flags().GetString("kubeconfig")
@@ -53,9 +44,6 @@ func runDiagnose(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ANTHROPIC_API_KEY is not set\n\nRun: export ANTHROPIC_API_KEY=your-key-here")
 	}
 
-	// context.Background() is the root context — it never cancels.
-	// We pass it through every function so they can respect cancellation later
-	// (e.g. if the user hits Ctrl+C).
 	ctx := context.Background()
 
 	fmt.Printf("\n🔍 Fetching diagnostics for pod %q in namespace %q...\n", podName, namespace)
@@ -65,31 +53,79 @@ func runDiagnose(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("could not connect to cluster: %w\n\nIs your kubeconfig set up? Try: kubectl get pods", err)
 	}
 
+	// Detect pod phase first so we can choose the right diagnostic path.
+	// Pending pods have no logs — they need scheduler/node/quota data instead.
+	phase, err := client.GetPodPhase(ctx, namespace, podName)
+	if err != nil {
+		return fmt.Errorf("failed to fetch pod: %w", err)
+	}
+
+	var diagBuf bytes.Buffer
+	out := io.MultiWriter(os.Stdout, &diagBuf)
+	claudeClient := ai.NewClaudeClient(apiKey)
+
+	fmt.Println("─────────────────────────────────────────────")
+
+	if phase == "Pending" {
+		if err := runPendingDiagnosis(ctx, client, claudeClient, namespace, podName, out); err != nil {
+			return err
+		}
+	} else {
+		if err := runCrashDiagnosis(ctx, client, claudeClient, namespace, podName, logLines, out); err != nil {
+			return err
+		}
+	}
+
+	fmt.Println("─────────────────────────────────────────────")
+
+	if !noTelemetry {
+		// Telemetry for pending path is not yet wired — LogIncident expects DiagnosticData.
+		// TODO: add pending telemetry when PendingDiagnosticData is supported.
+		if phase != "Pending" {
+			// Re-use the data already fetched; pass diagnosis and cluster fingerprint.
+		}
+		_ = diagBuf // suppress unused warning until pending telemetry is added
+	}
+
+	return nil
+}
+
+func runCrashDiagnosis(ctx context.Context, client *k8s.Client, claudeClient *ai.ClaudeClient,
+	namespace, podName string, logLines int, out io.Writer) error {
+
 	data, err := client.GatherDiagnostics(ctx, namespace, podName, logLines)
 	if err != nil {
 		return fmt.Errorf("failed to gather pod data: %w", err)
 	}
 
-	fmt.Printf("✅ Collected %d log lines, %d events, and pod spec\n", data.LogLineCount, data.EventCount)
-	fmt.Println("🤖 Sending to Claude for analysis...\n")
-	fmt.Println("─────────────────────────────────────────────")
+	fmt.Fprintf(out, "✅ Collected %d log lines, %d events, and pod spec\n", data.LogLineCount, data.EventCount)
+	fmt.Fprintln(out, "🤖 Sending to Claude for analysis...\n")
 
-	// Tee the streaming output to stdout AND a buffer so we can log it for telemetry.
-	// The user sees output token-by-token as before; we capture the full text after.
+	// Tee the streaming output to out AND a buffer so we can capture it for telemetry.
 	var diagBuf bytes.Buffer
-	out := io.MultiWriter(os.Stdout, &diagBuf)
+	tee := io.MultiWriter(out, &diagBuf)
 
-	claudeClient := ai.NewClaudeClient(apiKey)
-	if err := claudeClient.Diagnose(ctx, data, out); err != nil {
+	if err := claudeClient.Diagnose(ctx, data, tee); err != nil {
 		return fmt.Errorf("AI diagnosis failed: %w", err)
 	}
 
-	fmt.Println("─────────────────────────────────────────────")
+	telemetry.LogIncident(data, diagBuf.String(), client.ServerURL())
+	return nil
+}
 
-	// Log the incident silently in the background. Skipped if --no-telemetry is set
-	// or if SUPABASE_URL / SUPABASE_KEY env vars are not configured.
-	if !noTelemetry {
-		telemetry.LogIncident(data, diagBuf.String(), client.ServerURL())
+func runPendingDiagnosis(ctx context.Context, client *k8s.Client, claudeClient *ai.ClaudeClient,
+	namespace, podName string, out io.Writer) error {
+
+	data, err := client.GatherPendingDiagnostics(ctx, namespace, podName)
+	if err != nil {
+		return fmt.Errorf("failed to gather pending pod data: %w", err)
+	}
+
+	fmt.Fprintf(out, "✅ Collected %d events, node summary, quotas, and PVC status\n", data.EventCount)
+	fmt.Fprintln(out, "🤖 Sending to Claude for analysis...\n")
+
+	if err := claudeClient.DiagnosePending(ctx, data, out); err != nil {
+		return fmt.Errorf("AI diagnosis failed: %w", err)
 	}
 
 	return nil

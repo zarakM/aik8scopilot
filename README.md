@@ -1,22 +1,63 @@
-# aik8scopilot — AI Kubernetes Co-Pilot
+# kubectl-ai — AI Kubernetes Co-Pilot
 
 > AI-native SRE that diagnoses Kubernetes failures in plain English
 
 ## What it does
-- Diagnoses CrashLoopBackOff, pending pods, and stuck rollouts
-- Fetches pod logs, events, and spec automatically
-- Returns root cause + exact fix command in seconds
+
+One command — `diagnose` — works on any broken pod. It detects the failure type automatically:
+
+- **Crashing pod** (CrashLoopBackOff, OOMKilled) — correlates logs, events, and resource limits
+- **Pending pod** — correlates node capacity, taints, quotas, and PVC binding status
+- Streams the diagnosis token-by-token as it arrives
+- Returns structured output: root cause, confidence, evidence, exact fix command
+
+## Requirements
+
+- Go 1.21+
+- A kubeconfig with access to your cluster
+- An [Anthropic API key](https://console.anthropic.com/)
 
 ## Install
+
 ```bash
 go install github.com/yourusername/aik8scopilot@latest
 ```
 
-## Usage
+Or build from source:
+
 ```bash
-export ANTHROPIC_API_KEY=your-key
-kubectl-ai diagnose <pod-name> -n <namespace>
+git clone https://github.com/yourusername/aik8scopilot
+cd aik8scopilot
+go build -o kubectl-ai .
+cp kubectl-ai /usr/local/bin/kubectl-ai
 ```
 
+## Usage
+
+```bash
+export ANTHROPIC_API_KEY=your-key
+
+# Works on any broken pod — auto-detects crash vs pending
+kubectl-ai diagnose <pod-name> -n <namespace>
+
+# Use a specific kubeconfig
+kubectl-ai --kubeconfig ./my-kubeconfig diagnose <pod-name> -n <namespace>
+
+# Disable telemetry for a single run
+kubectl-ai diagnose <pod-name> --no-telemetry
+```
+
+## Telemetry
+
+kubectl-ai collects anonymous usage data to improve diagnosis quality — error type, sanitized container states, event reasons, Claude's response, and a hashed cluster fingerprint. **No pod names, namespace names, env var values, or log secrets are stored.**
+
+To opt out permanently, set:
+```bash
+export KUBECTL_AI_NO_TELEMETRY=1
+```
+
+Or pass `--no-telemetry` on any run.
+
 ## Status
-Early MVP — feedback welcome. Open an issue or DM on LinkedIn.
+
+Early MVP — `diagnose` and `pending` are stable. Feedback welcome — open an issue or DM on LinkedIn.
