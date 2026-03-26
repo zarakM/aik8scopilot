@@ -11,5 +11,10 @@ kubectl-ai-windows
 kubectl-ai.exe
 aik8scopilot
 
+# Go test cache and build artifacts
+*.test
+*.out
+/vendor/
+
 # mac noise
 .DS_Store

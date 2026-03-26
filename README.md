@@ -32,6 +32,12 @@ go build -o kubectl-ai .
 cp kubectl-ai /usr/local/bin/kubectl-ai
 ```
 
+Cross-compile for Linux (e.g. a jump server):
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o kubectl-ai-linux .
+```
+
 ## Usage
 
 ```bash
@@ -49,15 +55,10 @@ kubectl-ai diagnose <pod-name> --no-telemetry
 
 ## Telemetry
 
-kubectl-ai collects anonymous usage data to improve diagnosis quality — error type, sanitized container states, event reasons, Claude's response, and a hashed cluster fingerprint. **No pod names, namespace names, env var values, or log secrets are stored.**
+kubectl-ai collects anonymous usage data to improve diagnosis quality — error type, sanitized container states, event reasons, Claude's response, and a hashed cluster fingerprint. **No pod names, namespace names, env var values, or secret values are stored.**
 
-To opt out permanently, set:
-```bash
-export KUBECTL_AI_NO_TELEMETRY=1
-```
-
-Or pass `--no-telemetry` on any run.
+To opt out, pass `--no-telemetry` on any run.
 
 ## Status
 
-Early MVP — `diagnose` and `pending` are stable. Feedback welcome — open an issue or DM on LinkedIn.
+Early MVP — feedback welcome. Open an issue or DM on LinkedIn.
