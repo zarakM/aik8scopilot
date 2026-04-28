@@ -26,7 +26,7 @@ go install github.com/yourusername/aik8scopilot@latest
 Or build from source:
 
 ```bash
-git clone https://github.com/yourusername/aik8scopilot
+git clone https://github.com/zarakm/aik8scopilot
 cd aik8scopilot
 go build -o kubectl-ai .
 cp kubectl-ai /usr/local/bin/kubectl-ai
