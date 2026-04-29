@@ -20,7 +20,7 @@ One command — `diagnose` — works on any broken pod. It detects the failure t
 ## Install
 
 ```bash
-go install github.com/yourusername/aik8scopilot@latest
+go install github.com/zarakm/aik8scopilot@latest
 ```
 
 Or build from source:
