@@ -1,0 +1,57 @@
+# Test deployment whose rollout is permanently stuck.
+#
+# The readiness probe checks port 9999 (nothing listens there), so pods reach
+# Running but never become Ready. The new ReplicaSet never reaches readyReplicas,
+# .status.conditions eventually flips to Progressing=False/ProgressDeadlineExceeded.
+#
+# Deploy:   kubectl apply -f testdata/stuck-rollout.yaml
+# Wait:     kubectl rollout status deploy/stuck-app --timeout=30s   # will hang
+# Diagnose: ./kubectl-ai rollout stuck-app
+# Cleanup:  kubectl delete -f testdata/stuck-rollout.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stuck-app
+  labels:
+    app: stuck-app
+    purpose: kubectl-ai-testing
+spec:
+  replicas: 3
+  # ProgressDeadlineSeconds: 60 — surfaces the canonical "stuck" condition fast
+  # instead of the default 600s, so the test fixture is usable in under a minute.
+  progressDeadlineSeconds: 60
+  selector:
+    matchLabels:
+      app: stuck-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 means a single broken new pod halts the rollout.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: stuck-app
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          # The probe targets a port that nothing is listening on — guaranteed failure.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9999
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"

@@ -18,3 +18,24 @@ aik8scopilot
 
 # mac noise
 .DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage and profiling
+coverage.out
+coverage.html
+*.prof
+*.pprof
+__debug_bin*
+
+# Local build / release scripts that may carry baked-in Supabase keys
+build-prod.sh
+release.sh
+*.local.sh
+Makefile.local
+secrets.env
+.envrc

@@ -13,7 +13,7 @@ One command — `diagnose` — works on any broken pod. It detects the failure t
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.23+
 - A kubeconfig with access to your cluster
 - An [Anthropic API key](https://console.anthropic.com/)
 

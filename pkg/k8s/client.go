@@ -8,10 +8,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -405,6 +410,352 @@ func formatEvents(events *corev1.EventList) string {
 	for _, e := range events.Items {
 		// Type is "Normal" or "Warning". Warning events are the interesting ones.
 		sb.WriteString(fmt.Sprintf("[%s] %s: %s\n", e.Type, e.Reason, e.Message))
+	}
+	return sb.String()
+}
+
+// RolloutDiagnosticData holds everything the AI needs to diagnose a stuck Deployment rollout.
+// Pod names appear in PodSummary/WorstPodName for the *prompt only*; if telemetry is later wired
+// for the rollout path it MUST sanitize these out (per CLAUDE.md telemetry rules).
+type RolloutDiagnosticData struct {
+	DeploymentName string
+	Namespace      string
+	DeploymentSpec string
+	Status         string
+	ReplicaSets    string
+	PodSummary     string
+	WorstPodSpec   string
+	WorstPodLogs   string
+	WorstPodName   string
+	Events         string
+	PDBs           string
+	EventCount     int
+	PodCount       int
+}
+
+// GatherRolloutDiagnostics collects everything needed to diagnose a stuck rollout:
+// the deployment, its replicasets, owned pods, combined events, and matching PDBs.
+// The "worst pod" gets pod-spec + logs treatment so Claude has a concrete failure to read.
+func (c *Client) GatherRolloutDiagnostics(ctx context.Context, namespace, deploymentName string, logLines int) (*RolloutDiagnosticData, error) {
+	data := &RolloutDiagnosticData{
+		DeploymentName: deploymentName,
+		Namespace:      namespace,
+	}
+
+	// --- 1. Fetch the deployment ---
+	dep, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("deployment %q not found in namespace %q: %w", deploymentName, namespace, err)
+	}
+	data.DeploymentSpec = formatDeploymentSpec(dep)
+	data.Status = formatDeploymentStatus(dep)
+
+	// --- 2. List ReplicaSets owned by this deployment ---
+	// We list all RS in the namespace and filter by ownerRef UID — cheaper than label-matching
+	// against pod-template-hash and works even if labels were modified.
+	rsList, err := c.clientset.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
+	owned := []appsv1.ReplicaSet{}
+	if err == nil {
+		for _, rs := range rsList.Items {
+			for _, ref := range rs.OwnerReferences {
+				if ref.UID == dep.UID {
+					owned = append(owned, rs)
+					break
+				}
+			}
+		}
+		// Sort newest first — the rolling RS is at index 0.
+		sort.Slice(owned, func(i, j int) bool {
+			return owned[i].CreationTimestamp.After(owned[j].CreationTimestamp.Time)
+		})
+		data.ReplicaSets = formatReplicaSets(owned)
+	}
+
+	// --- 3. List pods matching the deployment's selector ---
+	selector, err := metav1.LabelSelectorAsSelector(dep.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("invalid deployment selector: %w", err)
+	}
+	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector.String(),
+	})
+
+	var worstPod *corev1.Pod
+	if err == nil {
+		summary, worst := formatRolloutPods(pods.Items)
+		data.PodSummary = summary
+		data.PodCount = len(pods.Items)
+		worstPod = worst
+	}
+
+	// --- 4. Worst-pod spec + logs ---
+	// Fetching logs from every replica would balloon the prompt; one well-chosen pod is enough.
+	if worstPod != nil {
+		data.WorstPodName = worstPod.Name
+		data.WorstPodSpec = formatPodSpec(worstPod)
+
+		var logBlobs []string
+		for _, container := range worstPod.Spec.Containers {
+			logs, lerr := c.fetchLogs(ctx, namespace, worstPod.Name, container.Name, int64(logLines), false)
+			if lerr == nil && logs != "" {
+				logBlobs = append(logBlobs, fmt.Sprintf("=== %s (current) ===\n%s", container.Name, logs))
+			}
+			prevLogs, _ := c.fetchLogs(ctx, namespace, worstPod.Name, container.Name, int64(logLines), true)
+			if prevLogs != "" {
+				logBlobs = append(logBlobs, fmt.Sprintf("=== %s (previous crashed instance) ===\n%s", container.Name, prevLogs))
+			}
+		}
+		data.WorstPodLogs = strings.Join(logBlobs, "\n")
+	}
+
+	// --- 5. Combined events: deployment + RS + pods ---
+	// The scheduler/controller-manager writes the highest-signal text here.
+	events := c.gatherRolloutEvents(ctx, namespace, dep, owned, pods)
+	data.Events = events.formatted
+	data.EventCount = events.count
+
+	// --- 6. PDBs whose selector matches deployment pods ---
+	// A PDB with disruptionsAllowed=0 silently blocks the old RS from terminating pods,
+	// stalling the rollout even when the new pods are healthy.
+	if pdbList, err := c.clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{}); err == nil {
+		data.PDBs = formatMatchingPDBs(pdbList.Items, dep.Spec.Template.Labels)
+	} else {
+		data.PDBs = "Failed to list PodDisruptionBudgets."
+	}
+
+	return data, nil
+}
+
+// rolloutEventBundle is a small carrier so gatherRolloutEvents can return both text and count.
+type rolloutEventBundle struct {
+	formatted string
+	count     int
+}
+
+// gatherRolloutEvents pulls events for the Deployment, each owned ReplicaSet, and each pod,
+// then formats them sorted by timestamp desc, capped at 50 entries.
+func (c *Client) gatherRolloutEvents(ctx context.Context, namespace string, dep *appsv1.Deployment, replicaSets []appsv1.ReplicaSet, pods *corev1.PodList) rolloutEventBundle {
+	type tagged struct {
+		ts     time.Time
+		typ    string
+		reason string
+		msg    string
+		source string // "Deployment", "ReplicaSet", "Pod"
+	}
+	var all []tagged
+
+	collect := func(name, source string) {
+		evList, err := c.clientset.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.namespace=%s", name, namespace),
+		})
+		if err != nil {
+			return
+		}
+		for _, e := range evList.Items {
+			all = append(all, tagged{
+				ts:     e.LastTimestamp.Time,
+				typ:    e.Type,
+				reason: e.Reason,
+				msg:    e.Message,
+				source: source,
+			})
+		}
+	}
+
+	collect(dep.Name, "Deployment")
+	for _, rs := range replicaSets {
+		collect(rs.Name, "ReplicaSet")
+	}
+	if pods != nil {
+		for _, p := range pods.Items {
+			collect(p.Name, "Pod")
+		}
+	}
+
+	sort.Slice(all, func(i, j int) bool { return all[i].ts.After(all[j].ts) })
+
+	const cap = 50
+	if len(all) > cap {
+		all = all[:cap]
+	}
+
+	if len(all) == 0 {
+		return rolloutEventBundle{formatted: "No events found.", count: 0}
+	}
+
+	var sb strings.Builder
+	for _, e := range all {
+		sb.WriteString(fmt.Sprintf("[%s][%s] %s: %s\n", e.typ, e.source, e.reason, e.msg))
+	}
+	return rolloutEventBundle{formatted: sb.String(), count: len(all)}
+}
+
+// formatDeploymentSpec summarises strategy, replicas, and selector — the things that govern
+// how the rollout *should* behave.
+func formatDeploymentSpec(dep *appsv1.Deployment) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Deployment: %s/%s\n", dep.Namespace, dep.Name))
+
+	desired := int32(0)
+	if dep.Spec.Replicas != nil {
+		desired = *dep.Spec.Replicas
+	}
+	sb.WriteString(fmt.Sprintf("Desired replicas: %d\n", desired))
+
+	sb.WriteString(fmt.Sprintf("Strategy: %s\n", dep.Spec.Strategy.Type))
+	if dep.Spec.Strategy.RollingUpdate != nil {
+		ru := dep.Spec.Strategy.RollingUpdate
+		if ru.MaxSurge != nil {
+			sb.WriteString(fmt.Sprintf("  maxSurge: %s\n", ru.MaxSurge.String()))
+		}
+		if ru.MaxUnavailable != nil {
+			sb.WriteString(fmt.Sprintf("  maxUnavailable: %s\n", ru.MaxUnavailable.String()))
+		}
+	}
+	if dep.Spec.ProgressDeadlineSeconds != nil {
+		sb.WriteString(fmt.Sprintf("ProgressDeadlineSeconds: %d\n", *dep.Spec.ProgressDeadlineSeconds))
+	}
+	if dep.Spec.Selector != nil {
+		sb.WriteString(fmt.Sprintf("Selector: %s\n", metav1.FormatLabelSelector(dep.Spec.Selector)))
+	}
+	return sb.String()
+}
+
+// formatDeploymentStatus shows the .status counters and conditions —
+// .status.conditions is the highest-signal field for diagnosing a stuck rollout
+// (Progressing=False with reason ProgressDeadlineExceeded is the canonical "stuck" signal).
+func formatDeploymentStatus(dep *appsv1.Deployment) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Replicas:            %d\n", dep.Status.Replicas))
+	sb.WriteString(fmt.Sprintf("UpdatedReplicas:     %d\n", dep.Status.UpdatedReplicas))
+	sb.WriteString(fmt.Sprintf("ReadyReplicas:       %d\n", dep.Status.ReadyReplicas))
+	sb.WriteString(fmt.Sprintf("AvailableReplicas:   %d\n", dep.Status.AvailableReplicas))
+	sb.WriteString(fmt.Sprintf("UnavailableReplicas: %d\n", dep.Status.UnavailableReplicas))
+	sb.WriteString(fmt.Sprintf("ObservedGeneration:  %d (spec gen %d)\n", dep.Status.ObservedGeneration, dep.Generation))
+
+	if len(dep.Status.Conditions) > 0 {
+		sb.WriteString("Conditions:\n")
+		for _, cond := range dep.Status.Conditions {
+			sb.WriteString(fmt.Sprintf("  %s = %s | reason=%s | %s\n",
+				cond.Type, cond.Status, cond.Reason, cond.Message))
+		}
+	}
+	return sb.String()
+}
+
+// formatReplicaSets prints one line per RS sorted newest-first, with revision and replica counts.
+// The first RS in the list is the "rolling" one that the deployment is currently scaling up.
+func formatReplicaSets(rsList []appsv1.ReplicaSet) string {
+	if len(rsList) == 0 {
+		return "No ReplicaSets found for this deployment."
+	}
+	var sb strings.Builder
+	for i, rs := range rsList {
+		desired := int32(0)
+		if rs.Spec.Replicas != nil {
+			desired = *rs.Spec.Replicas
+		}
+		role := "old"
+		if i == 0 {
+			role = "current"
+		}
+		revision := rs.Annotations["deployment.kubernetes.io/revision"]
+		sb.WriteString(fmt.Sprintf("- %s (%s, revision %s): desired=%d, ready=%d, available=%d\n",
+			rs.Name, role, revision, desired, rs.Status.ReadyReplicas, rs.Status.AvailableReplicas))
+	}
+	return sb.String()
+}
+
+// formatRolloutPods returns a per-pod summary string and picks the "worst" pod —
+// the one most likely to explain why the rollout is stuck. Ranking from worst to best:
+// CrashLoopBackOff > ImagePullBackOff/ErrImagePull > Waiting (any) > Running-but-NotReady > Ready.
+func formatRolloutPods(pods []corev1.Pod) (string, *corev1.Pod) {
+	if len(pods) == 0 {
+		return "No pods found for this deployment.", nil
+	}
+
+	var sb strings.Builder
+	var worst *corev1.Pod
+	worstRank := -1
+
+	for i := range pods {
+		p := &pods[i]
+		sb.WriteString(fmt.Sprintf("- %s | phase=%s\n", p.Name, p.Status.Phase))
+
+		podRank := 0
+		for _, cs := range p.Status.ContainerStatuses {
+			state := "Running"
+			rank := 0
+			switch {
+			case cs.State.Waiting != nil:
+				reason := cs.State.Waiting.Reason
+				state = fmt.Sprintf("Waiting: %s", reason)
+				switch reason {
+				case "CrashLoopBackOff":
+					rank = 4
+				case "ImagePullBackOff", "ErrImagePull":
+					rank = 3
+				default:
+					rank = 2
+				}
+			case cs.State.Terminated != nil:
+				state = fmt.Sprintf("Terminated: %s (exit %d)",
+					cs.State.Terminated.Reason, cs.State.Terminated.ExitCode)
+				rank = 2
+			case cs.State.Running != nil && !cs.Ready:
+				state = "Running (not ready)"
+				rank = 1
+			}
+			if rank > podRank {
+				podRank = rank
+			}
+			sb.WriteString(fmt.Sprintf("    %s: %s | restarts=%d | ready=%v\n",
+				cs.Name, state, cs.RestartCount, cs.Ready))
+		}
+
+		if podRank > worstRank {
+			worstRank = podRank
+			worst = p
+		}
+	}
+
+	return sb.String(), worst
+}
+
+// formatMatchingPDBs lists only PDBs whose selector matches the deployment's pod-template labels.
+// A non-matching PDB is irrelevant noise; a matching one with disruptionsAllowed=0 is the smoking gun.
+func formatMatchingPDBs(pdbs []policyv1.PodDisruptionBudget, podLabels map[string]string) string {
+	podLabelSet := labels.Set(podLabels)
+
+	var matched []policyv1.PodDisruptionBudget
+	for _, pdb := range pdbs {
+		if pdb.Spec.Selector == nil {
+			continue
+		}
+		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		if sel.Matches(podLabelSet) {
+			matched = append(matched, pdb)
+		}
+	}
+
+	if len(matched) == 0 {
+		return "No PodDisruptionBudgets match this deployment's pods."
+	}
+
+	var sb strings.Builder
+	for _, pdb := range matched {
+		sb.WriteString(fmt.Sprintf("PDB: %s\n", pdb.Name))
+		if pdb.Spec.MinAvailable != nil {
+			sb.WriteString(fmt.Sprintf("  minAvailable: %s\n", pdb.Spec.MinAvailable.String()))
+		}
+		if pdb.Spec.MaxUnavailable != nil {
+			sb.WriteString(fmt.Sprintf("  maxUnavailable: %s\n", pdb.Spec.MaxUnavailable.String()))
+		}
+		sb.WriteString(fmt.Sprintf("  currentHealthy=%d, desiredHealthy=%d, disruptionsAllowed=%d, expectedPods=%d\n",
+			pdb.Status.CurrentHealthy, pdb.Status.DesiredHealthy, pdb.Status.DisruptionsAllowed, pdb.Status.ExpectedPods))
 	}
 	return sb.String()
 }
