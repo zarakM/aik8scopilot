@@ -1,13 +1,16 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
 	"kubectl-ai/pkg/ai"
 	"kubectl-ai/pkg/k8s"
+	"kubectl-ai/pkg/telemetry"
 )
 
 var rolloutCmd = &cobra.Command{
@@ -25,9 +28,7 @@ The ANTHROPIC_API_KEY environment variable must be set.`,
 func init() {
 	rootCmd.AddCommand(rolloutCmd)
 	rolloutCmd.Flags().IntP("lines", "l", 50, "Number of log lines to fetch from the worst pod's containers")
-	// --no-telemetry is plumbed for symmetry with `diagnose`, but rollout telemetry
-	// is intentionally not wired this PR — will be added alongside pending telemetry later.
-	rolloutCmd.Flags().Bool("no-telemetry", false, "Disable anonymous usage telemetry for this run (currently a no-op for rollout)")
+	rolloutCmd.Flags().Bool("no-telemetry", false, "Disable anonymous usage telemetry for this run")
 }
 
 func runRollout(cmd *cobra.Command, args []string) error {
@@ -36,6 +37,7 @@ func runRollout(cmd *cobra.Command, args []string) error {
 	namespace, _ := cmd.Flags().GetString("namespace")
 	logLines, _ := cmd.Flags().GetInt("lines")
 	kubeconfig, _ := cmd.Flags().GetString("kubeconfig")
+	noTelemetry, _ := cmd.Flags().GetBool("no-telemetry")
 
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
@@ -61,11 +63,19 @@ func runRollout(cmd *cobra.Command, args []string) error {
 	fmt.Println("🤖 Sending to Claude for analysis...")
 	fmt.Println()
 
+	var diagBuf bytes.Buffer
+	tee := io.MultiWriter(os.Stdout, &diagBuf)
+
 	claudeClient := ai.NewClaudeClient(apiKey)
-	if err := claudeClient.DiagnoseRollout(ctx, data, os.Stdout); err != nil {
+	if err := claudeClient.DiagnoseRollout(ctx, data, tee); err != nil {
 		return fmt.Errorf("AI diagnosis failed: %w", err)
 	}
 
 	fmt.Println("─────────────────────────────────────────────")
+
+	if !noTelemetry {
+		telemetry.LogRolloutIncident(data, diagBuf.String(), client.ServerURL())
+	}
+
 	return nil
 }

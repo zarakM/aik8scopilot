@@ -45,10 +45,10 @@ cmd/<command>.go
 - `cmd/` — orchestration only; no business logic. Each command follows the same pattern: gather → stream → (log). `diagnose.go` auto-detects pod phase (Pending vs other) and routes to the right gathering path internally — there is intentionally no separate `pending` subcommand.
 - `pkg/k8s/client.go` — all `client-go` calls. Three diagnostic data types: `DiagnosticData` (crash), `PendingDiagnosticData` (scheduling), `RolloutDiagnosticData` (stuck deployments). `formatPodSpec` strips secret values. `formatRolloutPods` ranks pods CrashLoopBackOff > ImagePull > Waiting > NotReady > Ready and picks one "worst pod" so the prompt only carries logs for the most-broken replica.
 - `pkg/ai/claude.go` — prompt construction + streaming. `streamTo()` is shared by all `Diagnose*` methods (`Diagnose`, `DiagnosePending`, `DiagnoseRollout`). Each path has its own system prompt; all enforce the same output format (Root Cause / Confidence / Evidence / Probable Causes / Next Command / Fix).
-- `pkg/telemetry/logger.go` — silent background logging to Supabase. `supabaseURL`/`supabaseKey` are injected via `-ldflags`; env vars override for local dev. Never blocks the CLI. `--no-telemetry` flag on diagnose disables per-run. Only the crash path is wired today; pending and rollout `--no-telemetry` flags are plumbed but no-op until telemetry is extended.
+- `pkg/telemetry/logger.go` — silent background logging to Supabase. `supabaseURL`/`supabaseKey` are injected via `-ldflags`; env vars override for local dev. Never blocks the CLI. All three paths (`crash`, `pending`, `rollout`) log via `LogCrashIncident` / `LogPendingIncident` / `LogRolloutIncident`, sharing a single `postIncident` helper. `--no-telemetry` disables per-run on every command. Each path writes a row tagged with `incident_type` and a path-specific `signals` jsonb shape.
 
 ### Telemetry data model (Supabase `incidents` table)
-Seven fields: `error_type`, `signals` (jsonb — sanitized container states + event reasons + log tail), `diagnosis`, `confidence`, `cluster_id` (SHA256 of server URL, first 8 bytes), `model`, `created_at`. No pod names, namespace names, env var values, or secret names are stored.
+Eight fields: `incident_type` (`crash` | `pending` | `rollout`), `error_type`, `signals` (jsonb — schema-flexible per `incident_type`), `diagnosis`, `confidence`, `cluster_id` (SHA256 of server URL, first 8 bytes), `model`, `created_at`. No pod names, namespace names, deployment names, env var values, image strings, or secret names are stored. Sanitization invariant: `pkg/telemetry/logger.go` reads only from the structured side-fields on the diagnostic structs (e.g. `EventReasons`, `SchedulerReason`, `ReplicaCounts`, `WorstPodContainers`), never from the formatted-string fields. The single allowed exception is `WorstPodLogs`, used as `log_tail` for crash and rollout paths.
 
 ## MVP scope — 3 capabilities, 2 user-facing commands
 1. CrashLoopBackOff — `diagnose <pod>` ✅
@@ -61,7 +61,7 @@ Do NOT expand scope beyond these three. Specifically: no StatefulSet/DaemonSet r
 - Direct HTTP to Anthropic — no SDK, intentional. Do not introduce LLM frameworks.
 - Streaming via SSE (`bufio.Scanner` line-by-line) — `streamTo()` in `claude.go` is the single implementation.
 - Anthropic key = user's own (`ANTHROPIC_API_KEY`). Supabase keys = yours, baked in via ldflags.
-- Pending and rollout paths do not yet have telemetry wired. When adding it, both should land together (single consolidated change) following the `diagnose.go` crash pattern. Rollout has an extra constraint: the prompt currently includes pod names (worst-pod selection), which MUST be sanitized out before any rollout telemetry payload reaches Supabase.
+- Telemetry covers all three paths. Each path has its own structured side-fields on the diagnostic struct (added in `pkg/k8s/client.go`) which the logger reads — the formatted-string fields used in prompts are never touched by telemetry. Adding a new `incident_type` follows the same pattern: add side-fields, add a `Log*Incident` entry point with its own `*Signals` shape, gate at the call site on `--no-telemetry`.
 - Rollout data gathering deliberately fetches logs for *only one* worst pod — picked by `formatRolloutPods` ranking — to keep the prompt within token budget even on 20-replica deployments.
 
 ## Code style

@@ -66,67 +66,68 @@ func runDiagnose(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("─────────────────────────────────────────────")
 
+	var (
+		crashData   *k8s.DiagnosticData
+		pendingData *k8s.PendingDiagnosticData
+	)
+
 	if phase == "Pending" {
-		if err := runPendingDiagnosis(ctx, client, claudeClient, namespace, podName, out); err != nil {
-			return err
-		}
+		pendingData, err = runPendingDiagnosis(ctx, client, claudeClient, namespace, podName, out)
 	} else {
-		if err := runCrashDiagnosis(ctx, client, claudeClient, namespace, podName, logLines, out); err != nil {
-			return err
-		}
+		crashData, err = runCrashDiagnosis(ctx, client, claudeClient, namespace, podName, logLines, out)
+	}
+	if err != nil {
+		return err
 	}
 
 	fmt.Println("─────────────────────────────────────────────")
 
 	if !noTelemetry {
-		// Telemetry for pending path is not yet wired — LogIncident expects DiagnosticData.
-		// TODO: add pending telemetry when PendingDiagnosticData is supported.
-		if phase != "Pending" {
-			// Re-use the data already fetched; pass diagnosis and cluster fingerprint.
+		diagnosis := diagBuf.String()
+		serverURL := client.ServerURL()
+		if pendingData != nil {
+			telemetry.LogPendingIncident(pendingData, diagnosis, serverURL)
+		} else if crashData != nil {
+			telemetry.LogCrashIncident(crashData, diagnosis, serverURL)
 		}
-		_ = diagBuf // suppress unused warning until pending telemetry is added
 	}
 
 	return nil
 }
 
 func runCrashDiagnosis(ctx context.Context, client *k8s.Client, claudeClient *ai.ClaudeClient,
-	namespace, podName string, logLines int, out io.Writer) error {
+	namespace, podName string, logLines int, out io.Writer) (*k8s.DiagnosticData, error) {
 
 	data, err := client.GatherDiagnostics(ctx, namespace, podName, logLines)
 	if err != nil {
-		return fmt.Errorf("failed to gather pod data: %w", err)
+		return nil, fmt.Errorf("failed to gather pod data: %w", err)
 	}
 
 	fmt.Fprintf(out, "✅ Collected %d log lines, %d events, and pod spec\n", data.LogLineCount, data.EventCount)
-	fmt.Fprintln(out, "🤖 Sending to Claude for analysis...\n")
+	fmt.Fprintln(out, "🤖 Sending to Claude for analysis...")
+	fmt.Fprintln(out)
 
-	// Tee the streaming output to out AND a buffer so we can capture it for telemetry.
-	var diagBuf bytes.Buffer
-	tee := io.MultiWriter(out, &diagBuf)
-
-	if err := claudeClient.Diagnose(ctx, data, tee); err != nil {
-		return fmt.Errorf("AI diagnosis failed: %w", err)
+	if err := claudeClient.Diagnose(ctx, data, out); err != nil {
+		return nil, fmt.Errorf("AI diagnosis failed: %w", err)
 	}
-
-	telemetry.LogIncident(data, diagBuf.String(), client.ServerURL())
-	return nil
+	return data, nil
 }
 
 func runPendingDiagnosis(ctx context.Context, client *k8s.Client, claudeClient *ai.ClaudeClient,
-	namespace, podName string, out io.Writer) error {
+	namespace, podName string, out io.Writer) (*k8s.PendingDiagnosticData, error) {
 
 	data, err := client.GatherPendingDiagnostics(ctx, namespace, podName)
 	if err != nil {
-		return fmt.Errorf("failed to gather pending pod data: %w", err)
+		return nil, fmt.Errorf("failed to gather pending pod data: %w", err)
 	}
 
 	fmt.Fprintf(out, "✅ Collected %d events, node summary, quotas, and PVC status\n", data.EventCount)
-	fmt.Fprintln(out, "🤖 Sending to Claude for analysis...\n")
+	fmt.Fprintln(out, "🤖 Sending to Claude for analysis...")
+	fmt.Fprintln(out)
 
 	if err := claudeClient.DiagnosePending(ctx, data, out); err != nil {
-		return fmt.Errorf("AI diagnosis failed: %w", err)
+		return nil, fmt.Errorf("AI diagnosis failed: %w", err)
 	}
 
-	return nil
+	return data, nil
 }

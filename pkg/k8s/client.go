@@ -200,6 +200,15 @@ type PendingDiagnosticData struct {
 	NodeSummary  string // Capacity, allocatable, taints, and conditions for every node
 	QuotaSummary string // ResourceQuotas in the namespace (quota exhaustion blocks scheduling)
 	PVCSummary   string // PVC binding state for any volumes the pod references
+
+	// Structured side-fields for telemetry — populated alongside the formatted strings.
+	// Telemetry must read ONLY from these and never from the strings above (which contain
+	// pod / namespace / image identifiers). See pkg/telemetry/logger.go.
+	EventReasons     []string // unique scheduler/controller event reasons, e.g. ["FailedScheduling"]
+	HasResourceQuota bool     // true if any ResourceQuota exists in the namespace
+	HasUnboundPVC    bool     // true if any referenced PVC is not Bound
+	NodeCount        int
+	SchedulerReason  string // best-guess classifier (see classifySchedulerReason)
 }
 
 // GatherPendingDiagnostics collects scheduling context for a pod stuck in Pending.
@@ -222,9 +231,11 @@ func (c *Client) GatherPendingDiagnostics(ctx context.Context, namespace, podNam
 	events, err := c.clientset.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.namespace=%s", podName, namespace),
 	})
+	var eventMessages []string
 	if err == nil {
 		data.Events = formatEvents(events)
 		data.EventCount = len(events.Items)
+		data.EventReasons, eventMessages = collectEventReasonsAndMessages(events)
 	}
 
 	// --- 3. Summarise all nodes ---
@@ -232,6 +243,7 @@ func (c *Client) GatherPendingDiagnostics(ctx context.Context, namespace, podNam
 	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err == nil {
 		data.NodeSummary = formatNodes(nodes)
+		data.NodeCount = len(nodes.Items)
 	}
 
 	// --- 4. Fetch ResourceQuotas in the namespace ---
@@ -239,13 +251,74 @@ func (c *Client) GatherPendingDiagnostics(ctx context.Context, namespace, podNam
 	quotas, err := c.clientset.CoreV1().ResourceQuotas(namespace).List(ctx, metav1.ListOptions{})
 	if err == nil {
 		data.QuotaSummary = formatQuotas(quotas)
+		data.HasResourceQuota = len(quotas.Items) > 0
 	}
 
 	// --- 5. Check PVC binding for volumes the pod references ---
 	// An unbound PVC keeps the pod pending indefinitely (no storage = no schedule).
 	data.PVCSummary = formatPodPVCs(ctx, c, namespace, pod)
+	data.HasUnboundPVC = checkUnboundPVC(ctx, c, namespace, pod)
+
+	data.SchedulerReason = classifySchedulerReason(data.EventReasons, eventMessages, data.HasUnboundPVC, data.HasResourceQuota)
 
 	return data, nil
+}
+
+// collectEventReasonsAndMessages returns the unique set of event reasons (sanitization-safe)
+// and the raw message slice (used only for in-process classification — never stored).
+func collectEventReasonsAndMessages(events *corev1.EventList) ([]string, []string) {
+	seen := map[string]struct{}{}
+	var reasons []string
+	var messages []string
+	for _, e := range events.Items {
+		if _, ok := seen[e.Reason]; !ok {
+			seen[e.Reason] = struct{}{}
+			reasons = append(reasons, e.Reason)
+		}
+		messages = append(messages, e.Message)
+	}
+	return reasons, messages
+}
+
+// checkUnboundPVC returns true if any PVC referenced by the pod is not Bound.
+func checkUnboundPVC(ctx context.Context, c *Client, namespace string, pod *corev1.Pod) bool {
+	for _, vol := range pod.Spec.Volumes {
+		if vol.PersistentVolumeClaim == nil {
+			continue
+		}
+		pvc, err := c.clientset.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, vol.PersistentVolumeClaim.ClaimName, metav1.GetOptions{})
+		if err != nil || pvc.Status.Phase != corev1.ClaimBound {
+			return true
+		}
+	}
+	return false
+}
+
+// classifySchedulerReason maps event reasons + message keywords to a coarse category.
+// Returns one of: "InsufficientResources" / "TaintMismatch" / "QuotaExceeded" /
+// "PVCUnbound" / "Unknown". Messages are inspected in-process only — never persisted.
+func classifySchedulerReason(reasons, messages []string, hasUnboundPVC, hasQuota bool) string {
+	if hasUnboundPVC {
+		return "PVCUnbound"
+	}
+	joined := strings.ToLower(strings.Join(messages, " "))
+	if strings.Contains(joined, "exceeded quota") || strings.Contains(joined, "forbidden: exceeded") {
+		return "QuotaExceeded"
+	}
+	if strings.Contains(joined, "insufficient cpu") || strings.Contains(joined, "insufficient memory") || strings.Contains(joined, "insufficient ephemeral-storage") {
+		return "InsufficientResources"
+	}
+	if strings.Contains(joined, "untolerated taint") || strings.Contains(joined, "had taint") || strings.Contains(joined, "didn't tolerate") {
+		return "TaintMismatch"
+	}
+	for _, r := range reasons {
+		if r == "FailedScheduling" {
+			// Scheduling failed but we couldn't classify why — leave coarse.
+			return "Unknown"
+		}
+	}
+	_ = hasQuota
+	return "Unknown"
 }
 
 // formatNodes summarises capacity, allocatable resources, taints, and ready condition
@@ -415,8 +488,8 @@ func formatEvents(events *corev1.EventList) string {
 }
 
 // RolloutDiagnosticData holds everything the AI needs to diagnose a stuck Deployment rollout.
-// Pod names appear in PodSummary/WorstPodName for the *prompt only*; if telemetry is later wired
-// for the rollout path it MUST sanitize these out (per CLAUDE.md telemetry rules).
+// Pod names appear in PodSummary/WorstPodName for the *prompt only*. Telemetry MUST read
+// only from the structured side-fields below (never from the formatted strings).
 type RolloutDiagnosticData struct {
 	DeploymentName string
 	Namespace      string
@@ -431,6 +504,24 @@ type RolloutDiagnosticData struct {
 	PDBs           string
 	EventCount     int
 	PodCount       int
+
+	// Structured side-fields for telemetry — sanitization-safe.
+	ReplicaCounts      ReplicaCounts
+	ProgressingReason  string            // e.g. "ProgressDeadlineExceeded", "NewReplicaSetAvailable"
+	AvailableReason    string            // e.g. "MinimumReplicasAvailable", "MinimumReplicasUnavailable"
+	EventReasons       []string          // unique reasons across deployment + RS + pod events
+	WorstPodContainers []ContainerStatus // structured container states for the worst pod
+	PDBBlocked         bool              // a matching PDB had disruptionsAllowed == 0
+	ReplicaSetCount    int
+}
+
+// ReplicaCounts mirrors the deployment .status counters in a stable, JSON-friendly shape.
+type ReplicaCounts struct {
+	Desired     int32 `json:"desired"`
+	Updated     int32 `json:"updated"`
+	Ready       int32 `json:"ready"`
+	Available   int32 `json:"available"`
+	Unavailable int32 `json:"unavailable"`
 }
 
 // GatherRolloutDiagnostics collects everything needed to diagnose a stuck rollout:
@@ -449,6 +540,26 @@ func (c *Client) GatherRolloutDiagnostics(ctx context.Context, namespace, deploy
 	}
 	data.DeploymentSpec = formatDeploymentSpec(dep)
 	data.Status = formatDeploymentStatus(dep)
+
+	desiredReplicas := int32(0)
+	if dep.Spec.Replicas != nil {
+		desiredReplicas = *dep.Spec.Replicas
+	}
+	data.ReplicaCounts = ReplicaCounts{
+		Desired:     desiredReplicas,
+		Updated:     dep.Status.UpdatedReplicas,
+		Ready:       dep.Status.ReadyReplicas,
+		Available:   dep.Status.AvailableReplicas,
+		Unavailable: dep.Status.UnavailableReplicas,
+	}
+	for _, cond := range dep.Status.Conditions {
+		switch cond.Type {
+		case appsv1.DeploymentProgressing:
+			data.ProgressingReason = cond.Reason
+		case appsv1.DeploymentAvailable:
+			data.AvailableReason = cond.Reason
+		}
+	}
 
 	// --- 2. List ReplicaSets owned by this deployment ---
 	// We list all RS in the namespace and filter by ownerRef UID — cheaper than label-matching
@@ -469,6 +580,7 @@ func (c *Client) GatherRolloutDiagnostics(ctx context.Context, namespace, deploy
 			return owned[i].CreationTimestamp.After(owned[j].CreationTimestamp.Time)
 		})
 		data.ReplicaSets = formatReplicaSets(owned)
+		data.ReplicaSetCount = len(owned)
 	}
 
 	// --- 3. List pods matching the deployment's selector ---
@@ -493,6 +605,7 @@ func (c *Client) GatherRolloutDiagnostics(ctx context.Context, namespace, deploy
 	if worstPod != nil {
 		data.WorstPodName = worstPod.Name
 		data.WorstPodSpec = formatPodSpec(worstPod)
+		data.WorstPodContainers = extractContainerStatuses(worstPod)
 
 		var logBlobs []string
 		for _, container := range worstPod.Spec.Containers {
@@ -513,12 +626,14 @@ func (c *Client) GatherRolloutDiagnostics(ctx context.Context, namespace, deploy
 	events := c.gatherRolloutEvents(ctx, namespace, dep, owned, pods)
 	data.Events = events.formatted
 	data.EventCount = events.count
+	data.EventReasons = events.reasons
 
 	// --- 6. PDBs whose selector matches deployment pods ---
 	// A PDB with disruptionsAllowed=0 silently blocks the old RS from terminating pods,
 	// stalling the rollout even when the new pods are healthy.
 	if pdbList, err := c.clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{}); err == nil {
 		data.PDBs = formatMatchingPDBs(pdbList.Items, dep.Spec.Template.Labels)
+		data.PDBBlocked = anyMatchingPDBBlocking(pdbList.Items, dep.Spec.Template.Labels)
 	} else {
 		data.PDBs = "Failed to list PodDisruptionBudgets."
 	}
@@ -526,10 +641,58 @@ func (c *Client) GatherRolloutDiagnostics(ctx context.Context, namespace, deploy
 	return data, nil
 }
 
-// rolloutEventBundle is a small carrier so gatherRolloutEvents can return both text and count.
+// extractContainerStatuses turns a pod's runtime container statuses into our
+// sanitization-safe ContainerStatus slice (state strings only, no images / env).
+func extractContainerStatuses(pod *corev1.Pod) []ContainerStatus {
+	var out []ContainerStatus
+	for _, cs := range pod.Status.ContainerStatuses {
+		s := ContainerStatus{
+			Name:         cs.Name,
+			RestartCount: cs.RestartCount,
+			Ready:        cs.Ready,
+		}
+		switch {
+		case cs.State.Running != nil:
+			s.State = "Running"
+		case cs.State.Waiting != nil:
+			s.State = fmt.Sprintf("Waiting: %s", cs.State.Waiting.Reason)
+		case cs.State.Terminated != nil:
+			s.State = fmt.Sprintf("Terminated: %s (exit code %d)",
+				cs.State.Terminated.Reason, cs.State.Terminated.ExitCode)
+		}
+		if cs.LastTerminationState.Terminated != nil {
+			lt := cs.LastTerminationState.Terminated
+			s.LastState = fmt.Sprintf("Exit code %d (%s)", lt.ExitCode, lt.Reason)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// anyMatchingPDBBlocking returns true if any PDB whose selector matches the deployment's
+// pod template has disruptionsAllowed == 0 — the canonical "rollout blocked by PDB" signal.
+func anyMatchingPDBBlocking(pdbs []policyv1.PodDisruptionBudget, podLabels map[string]string) bool {
+	podLabelSet := labels.Set(podLabels)
+	for _, pdb := range pdbs {
+		if pdb.Spec.Selector == nil {
+			continue
+		}
+		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		if sel.Matches(podLabelSet) && pdb.Status.DisruptionsAllowed == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// rolloutEventBundle is a small carrier so gatherRolloutEvents can return text, count, and reasons.
 type rolloutEventBundle struct {
 	formatted string
 	count     int
+	reasons   []string
 }
 
 // gatherRolloutEvents pulls events for the Deployment, each owned ReplicaSet, and each pod,
@@ -584,10 +747,16 @@ func (c *Client) gatherRolloutEvents(ctx context.Context, namespace string, dep 
 	}
 
 	var sb strings.Builder
+	seen := map[string]struct{}{}
+	var reasons []string
 	for _, e := range all {
 		sb.WriteString(fmt.Sprintf("[%s][%s] %s: %s\n", e.typ, e.source, e.reason, e.msg))
+		if _, ok := seen[e.reason]; !ok {
+			seen[e.reason] = struct{}{}
+			reasons = append(reasons, e.reason)
+		}
 	}
-	return rolloutEventBundle{formatted: sb.String(), count: len(all)}
+	return rolloutEventBundle{formatted: sb.String(), count: len(all), reasons: reasons}
 }
 
 // formatDeploymentSpec summarises strategy, replicas, and selector — the things that govern

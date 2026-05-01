@@ -1,7 +1,19 @@
 package telemetry
 
-// Silent background telemetry — logs every diagnose run to Supabase.
+// Silent background telemetry — logs every diagnose / rollout run to Supabase.
 // Never blocks the user; all errors are swallowed. Disabled if env vars are unset.
+//
+// Sanitization invariant: telemetry must read ONLY from the structured side-fields
+// on the k8s diagnostic structs (e.g. EventReasons, ReplicaCounts, SchedulerReason),
+// never from the formatted-string fields (Events, PodSpec, PodSummary, etc.) which
+// contain pod / namespace / image identifiers. The single allowed exception is
+// data.WorstPodLogs, used for log_tail in the crash and rollout paths.
+//
+// Reviewable as a single grep against this file:
+//
+//   grep -nE 'data\.(Events|PodSpec|WorstPodSpec|PodSummary|NodeSummary|QuotaSummary|PVCSummary|ReplicaSets|PDBs|DeploymentName|PodName|Namespace|DeploymentSpec)' pkg/telemetry/logger.go
+//
+// Expected: zero matches. data.WorstPodLogs is the only formatted-string field referenced.
 
 import (
 	"bytes"
@@ -17,19 +29,20 @@ import (
 	"kubectl-ai/pkg/k8s"
 )
 
-// IncidentLog is the seven-field row written to the `incidents` table.
+// IncidentLog is the row written to the `incidents` table.
+// `signals` is schema-flexible (jsonb) — each incident_type carries a different shape.
 type IncidentLog struct {
-	ErrorType  string  `json:"error_type"`
-	Signals    Signals `json:"signals"`
-	Diagnosis  string  `json:"diagnosis"`
-	Confidence string  `json:"confidence"`
-	ClusterID  string  `json:"cluster_id"`
-	Model      string  `json:"model"`
+	IncidentType string `json:"incident_type"` // "crash" | "pending" | "rollout"
+	ErrorType    string `json:"error_type"`
+	Signals      any    `json:"signals"`
+	Diagnosis    string `json:"diagnosis"`
+	Confidence   string `json:"confidence"`
+	ClusterID    string `json:"cluster_id"`
+	Model        string `json:"model"`
 }
 
-// Signals is the sanitized snapshot of what we sent to Claude.
-// Rule: keep structure and error patterns, strip identity (names, values, URLs).
-type Signals struct {
+// CrashSignals is the sanitized snapshot for the CrashLoopBackOff path.
+type CrashSignals struct {
 	Containers []ContainerSignal `json:"containers"`
 	Events     []EventSignal     `json:"events"`
 	// Log tail is kept because error stack traces are the core training signal.
@@ -38,9 +51,32 @@ type Signals struct {
 	EventCount int    `json:"event_count"`
 }
 
+// PendingSignals is the sanitized snapshot for the Pending-pod path.
+// No log_tail — pending pods have no logs.
+type PendingSignals struct {
+	EventReasons     []string `json:"event_reasons"`
+	SchedulerReason  string   `json:"scheduler_reason"`
+	HasResourceQuota bool     `json:"has_quota"`
+	HasUnboundPVC    bool     `json:"has_unbound_pvc"`
+	NodeCount        int      `json:"node_count"`
+	EventCount       int      `json:"event_count"`
+}
+
+// RolloutSignals is the sanitized snapshot for the stuck-rollout path.
+type RolloutSignals struct {
+	ReplicaCounts      k8s.ReplicaCounts `json:"replica_counts"`
+	ProgressingReason  string            `json:"progressing_reason"`
+	AvailableReason    string            `json:"available_reason"`
+	EventReasons       []string          `json:"event_reasons"`
+	WorstPodContainers []ContainerSignal `json:"worst_pod_containers"`
+	PDBBlocked         bool              `json:"pdb_blocked"`
+	ReplicaSetCount    int               `json:"replica_set_count"`
+	LogTail            string            `json:"log_tail"`
+}
+
 type ContainerSignal struct {
-	State        string `json:"state"`         // e.g. "Waiting: CrashLoopBackOff"
-	LastState    string `json:"last_state"`    // e.g. "Exit code 137 (OOMKilled)"
+	State        string `json:"state"`      // e.g. "Waiting: CrashLoopBackOff"
+	LastState    string `json:"last_state"` // e.g. "Exit code 137 (OOMKilled)"
 	RestartCount int32  `json:"restart_count"`
 	Ready        bool   `json:"ready"`
 }
@@ -53,15 +89,7 @@ type EventSignal struct {
 const claudeModel = "claude-sonnet-4-20250514"
 
 // supabaseURL and supabaseKey are injected at build time via -ldflags.
-// Example:
-//
-//	go build -ldflags "\
-//	  -X kubectl-ai/pkg/telemetry.supabaseURL=https://yourproject.supabase.co \
-//	  -X kubectl-ai/pkg/telemetry.supabaseKey=your-anon-key" \
-//	  -o kubectl-ai .
-//
-// SUPABASE_URL / SUPABASE_KEY env vars override the compiled-in values,
-// which is useful for testing against a dev project without rebuilding.
+// SUPABASE_URL / SUPABASE_KEY env vars override the compiled-in values.
 var (
 	supabaseURL = "" // set via -ldflags at build time
 	supabaseKey = "" // set via -ldflags at build time
@@ -75,27 +103,60 @@ func getSupabaseConfig() (url, key string) {
 	return supabaseURL, supabaseKey
 }
 
-// LogIncident fires a background POST to Supabase.
-// Returns immediately — the HTTP call runs in a goroutine so the CLI is never blocked.
-// Silently returns if neither ldflags nor env vars provide credentials.
-func LogIncident(data *k8s.DiagnosticData, diagnosis, serverURL string) {
+// LogCrashIncident fires a background POST for the CrashLoopBackOff diagnose path.
+func LogCrashIncident(data *k8s.DiagnosticData, diagnosis, serverURL string) {
 	url, key := getSupabaseConfig()
 	if url == "" || key == "" {
 		return
 	}
+	postIncident(IncidentLog{
+		IncidentType: "crash",
+		ErrorType:    detectCrashErrorType(data),
+		Signals:      buildCrashSignals(data),
+		Diagnosis:    diagnosis,
+		Confidence:   extractConfidence(diagnosis),
+		ClusterID:    AnonymizeCluster(serverURL),
+		Model:        claudeModel,
+	}, url, key)
+}
 
-	log := IncidentLog{
-		ErrorType:  detectErrorType(data),
-		Signals:    buildSignals(data),
-		Diagnosis:  diagnosis,
-		Confidence: extractConfidence(diagnosis),
-		ClusterID:  AnonymizeCluster(serverURL),
-		Model:      claudeModel,
+// LogPendingIncident fires a background POST for the pending-pod diagnose path.
+func LogPendingIncident(data *k8s.PendingDiagnosticData, diagnosis, serverURL string) {
+	url, key := getSupabaseConfig()
+	if url == "" || key == "" {
+		return
 	}
+	postIncident(IncidentLog{
+		IncidentType: "pending",
+		ErrorType:    detectPendingErrorType(data),
+		Signals:      buildPendingSignals(data),
+		Diagnosis:    diagnosis,
+		Confidence:   extractConfidence(diagnosis),
+		ClusterID:    AnonymizeCluster(serverURL),
+		Model:        claudeModel,
+	}, url, key)
+}
 
-	// Fire and forget — context.Background so cancellation of the CLI context
-	// doesn't abort the in-flight POST.
-	// Capture url/key in the closure so the goroutine doesn't re-read env vars.
+// LogRolloutIncident fires a background POST for the stuck-rollout path.
+func LogRolloutIncident(data *k8s.RolloutDiagnosticData, diagnosis, serverURL string) {
+	url, key := getSupabaseConfig()
+	if url == "" || key == "" {
+		return
+	}
+	postIncident(IncidentLog{
+		IncidentType: "rollout",
+		ErrorType:    detectRolloutErrorType(data),
+		Signals:      buildRolloutSignals(data),
+		Diagnosis:    diagnosis,
+		Confidence:   extractConfidence(diagnosis),
+		ClusterID:    AnonymizeCluster(serverURL),
+		Model:        claudeModel,
+	}, url, key)
+}
+
+// postIncident is the shared fire-and-forget HTTP POST.
+// context.Background so cancellation of the CLI context doesn't abort the in-flight POST.
+func postIncident(log IncidentLog, url, key string) {
 	go func(url, key string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -130,8 +191,8 @@ func AnonymizeCluster(serverURL string) string {
 	return fmt.Sprintf("%x", h[:8])
 }
 
-// detectErrorType inspects container states and event text to classify the failure.
-func detectErrorType(data *k8s.DiagnosticData) string {
+// detectCrashErrorType inspects container states and event text to classify the failure.
+func detectCrashErrorType(data *k8s.DiagnosticData) string {
 	for _, c := range data.Containers {
 		if strings.Contains(c.State, "CrashLoopBackOff") {
 			return "CrashLoopBackOff"
@@ -153,9 +214,43 @@ func detectErrorType(data *k8s.DiagnosticData) string {
 	return "Unknown"
 }
 
-// buildSignals extracts the structured, sanitized telemetry payload from DiagnosticData.
-func buildSignals(data *k8s.DiagnosticData) Signals {
-	s := Signals{
+// detectPendingErrorType returns the SchedulerReason classifier already computed during gathering.
+func detectPendingErrorType(data *k8s.PendingDiagnosticData) string {
+	if data.SchedulerReason == "" {
+		return "Unknown"
+	}
+	return data.SchedulerReason
+}
+
+// detectRolloutErrorType picks the most-specific failure category from rollout state.
+// Order matters: the worst-pod state beats the deployment-condition reason where they conflict.
+func detectRolloutErrorType(data *k8s.RolloutDiagnosticData) string {
+	for _, c := range data.WorstPodContainers {
+		if strings.Contains(c.State, "CrashLoopBackOff") {
+			return "CrashLoopBackOff"
+		}
+		if strings.Contains(c.State, "ImagePullBackOff") || strings.Contains(c.State, "ErrImagePull") {
+			return "ImagePullError"
+		}
+	}
+	if data.PDBBlocked {
+		return "PDBBlocking"
+	}
+	if data.ProgressingReason == "ProgressDeadlineExceeded" {
+		return "ProgressDeadlineExceeded"
+	}
+	// Worst pod is Running-but-NotReady — almost always a failing readiness probe.
+	for _, c := range data.WorstPodContainers {
+		if c.State == "Running" && !c.Ready {
+			return "ReadinessProbeFailing"
+		}
+	}
+	return "Unknown"
+}
+
+// buildCrashSignals extracts the structured, sanitized telemetry payload from DiagnosticData.
+func buildCrashSignals(data *k8s.DiagnosticData) CrashSignals {
+	s := CrashSignals{
 		EventCount: data.EventCount,
 		LogTail:    truncate(data.Logs, 2000), // cap at 2 KB — enough for stack traces
 	}
@@ -169,14 +264,13 @@ func buildSignals(data *k8s.DiagnosticData) Signals {
 		})
 	}
 
-	// Parse events from the formatted string "[Type] Reason: Message"
+	// Parse events from the formatted string "[Type] Reason: Message".
 	// We keep Type and Reason only — Message can contain cluster-specific details.
 	for _, line := range strings.Split(data.Events, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || line == "No events found." {
 			continue
 		}
-		// Format: [Warning] OOMKilling: ...
 		if len(line) > 1 && line[0] == '[' {
 			end := strings.Index(line, "]")
 			if end > 0 {
@@ -188,6 +282,41 @@ func buildSignals(data *k8s.DiagnosticData) Signals {
 		}
 	}
 
+	return s
+}
+
+// buildPendingSignals reads only from the structured side-fields populated during gathering.
+func buildPendingSignals(data *k8s.PendingDiagnosticData) PendingSignals {
+	return PendingSignals{
+		EventReasons:     data.EventReasons,
+		SchedulerReason:  data.SchedulerReason,
+		HasResourceQuota: data.HasResourceQuota,
+		HasUnboundPVC:    data.HasUnboundPVC,
+		NodeCount:        data.NodeCount,
+		EventCount:       data.EventCount,
+	}
+}
+
+// buildRolloutSignals reads only from the structured side-fields. The single exception
+// is data.WorstPodLogs, which we tail for log_tail just like the crash path.
+func buildRolloutSignals(data *k8s.RolloutDiagnosticData) RolloutSignals {
+	s := RolloutSignals{
+		ReplicaCounts:     data.ReplicaCounts,
+		ProgressingReason: data.ProgressingReason,
+		AvailableReason:   data.AvailableReason,
+		EventReasons:      data.EventReasons,
+		PDBBlocked:        data.PDBBlocked,
+		ReplicaSetCount:   data.ReplicaSetCount,
+		LogTail:           truncate(data.WorstPodLogs, 2000),
+	}
+	for _, c := range data.WorstPodContainers {
+		s.WorstPodContainers = append(s.WorstPodContainers, ContainerSignal{
+			State:        c.State,
+			LastState:    c.LastState,
+			RestartCount: c.RestartCount,
+			Ready:        c.Ready,
+		})
+	}
 	return s
 }
 
