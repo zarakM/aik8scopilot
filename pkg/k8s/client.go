@@ -46,6 +46,17 @@ type DiagnosticData struct {
 	LogLineCount int
 	EventCount   int
 	Containers   []ContainerStatus
+
+	// Structured side-field for telemetry — Type+Reason only, never Message.
+	// Telemetry must read from this, not from the formatted Events string.
+	EventInfos []EventInfo
+}
+
+// EventInfo is the sanitization-safe slice of an event we keep for telemetry.
+// Message is intentionally excluded — it can carry cluster-specific identifiers.
+type EventInfo struct {
+	Type   string // "Normal" or "Warning"
+	Reason string // e.g. "OOMKilling", "BackOff", "FailedScheduling"
 }
 
 // ContainerStatus summarises the runtime state of a single container.
@@ -165,9 +176,19 @@ func (c *Client) GatherDiagnostics(ctx context.Context, namespace, podName strin
 	if err == nil {
 		data.Events = formatEvents(events)
 		data.EventCount = len(events.Items)
+		data.EventInfos = collectEventInfos(events)
 	}
 
 	return data, nil
+}
+
+// collectEventInfos turns a raw EventList into the sanitization-safe (Type, Reason) pairs.
+func collectEventInfos(events *corev1.EventList) []EventInfo {
+	out := make([]EventInfo, 0, len(events.Items))
+	for _, e := range events.Items {
+		out = append(out, EventInfo{Type: e.Type, Reason: e.Reason})
+	}
+	return out
 }
 
 // fetchLogs gets the last N lines from a container.

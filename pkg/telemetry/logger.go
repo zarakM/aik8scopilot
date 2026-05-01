@@ -191,7 +191,7 @@ func AnonymizeCluster(serverURL string) string {
 	return fmt.Sprintf("%x", h[:8])
 }
 
-// detectCrashErrorType inspects container states and event text to classify the failure.
+// detectCrashErrorType inspects container states and event reasons to classify the failure.
 func detectCrashErrorType(data *k8s.DiagnosticData) string {
 	for _, c := range data.Containers {
 		if strings.Contains(c.State, "CrashLoopBackOff") {
@@ -204,12 +204,14 @@ func detectCrashErrorType(data *k8s.DiagnosticData) string {
 			return "ImagePullError"
 		}
 	}
-	// Fall back to event text — OOMKilling appears here before the state updates.
-	if strings.Contains(data.Events, "OOMKilling") {
-		return "OOMKilled"
-	}
-	if strings.Contains(data.Events, "BackOff") {
-		return "CrashLoopBackOff"
+	// Fall back to event reasons — OOMKilling appears here before container state updates.
+	for _, e := range data.EventInfos {
+		switch e.Reason {
+		case "OOMKilling":
+			return "OOMKilled"
+		case "BackOff":
+			return "CrashLoopBackOff"
+		}
 	}
 	return "Unknown"
 }
@@ -249,6 +251,7 @@ func detectRolloutErrorType(data *k8s.RolloutDiagnosticData) string {
 }
 
 // buildCrashSignals extracts the structured, sanitized telemetry payload from DiagnosticData.
+// Reads only structured side-fields — never the formatted Events / PodSpec strings.
 func buildCrashSignals(data *k8s.DiagnosticData) CrashSignals {
 	s := CrashSignals{
 		EventCount: data.EventCount,
@@ -264,22 +267,8 @@ func buildCrashSignals(data *k8s.DiagnosticData) CrashSignals {
 		})
 	}
 
-	// Parse events from the formatted string "[Type] Reason: Message".
-	// We keep Type and Reason only — Message can contain cluster-specific details.
-	for _, line := range strings.Split(data.Events, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || line == "No events found." {
-			continue
-		}
-		if len(line) > 1 && line[0] == '[' {
-			end := strings.Index(line, "]")
-			if end > 0 {
-				typ := line[1:end]
-				rest := strings.TrimSpace(line[end+1:])
-				reason := strings.SplitN(rest, ":", 2)[0]
-				s.Events = append(s.Events, EventSignal{Type: typ, Reason: strings.TrimSpace(reason)})
-			}
-		}
+	for _, e := range data.EventInfos {
+		s.Events = append(s.Events, EventSignal{Type: e.Type, Reason: e.Reason})
 	}
 
 	return s
